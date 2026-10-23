@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Claude">
+<meta name="format-detection" content="telephone=no">
+<meta name="theme-color" content="#FAF9F5" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#262624" media="(prefers-color-scheme: dark)">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" href="/icons/icon-192.png">
+<link rel="stylesheet" href="/app.css">
+<title>Claude</title>
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <button id="btn-menu" class="icon-btn" aria-label="对话列表">
+      <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+    </button>
+    <button id="title-wrap" class="title-wrap" aria-label="对话信息">
+      <div id="title">Claude</div>
+      <div id="subtitle"></div>
+    </button>
+    <button id="btn-new" class="icon-btn" aria-label="新对话">
+      <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+    </button>
+    <button id="btn-more" class="icon-btn" aria-label="设置">
+      <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6" class="fill"/><circle cx="12" cy="12" r="1.6" class="fill"/><circle cx="19" cy="12" r="1.6" class="fill"/></svg>
+    </button>
+  </header>
+  <div id="conn" hidden></div>
+  <main id="scroller">
+    <div id="banner" hidden></div>
+    <div id="older-wrap" hidden><button id="btn-older" class="ghost-btn">加载更早的消息</button></div>
+    <div id="messages"></div>
+    <div id="live"></div>
+    <div id="empty" hidden></div>
+  </main>
+  <button id="jump" class="jump" hidden aria-label="回到底部">
+    <svg viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+  </button>
+  <section id="cards"></section>
+  <footer class="composer">
+    <div id="attach-list" class="attach-list" hidden></div>
+    <button id="statusline" class="statusline"></button>
+    <div class="composer-box">
+      <button id="btn-attach" class="icon-btn small" aria-label="添加照片或文件">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <textarea id="input" rows="1" placeholder="给 Claude 发消息" enterkeyhint="enter" autocomplete="off"></textarea>
+      <button id="btn-stop" class="round-btn stop" aria-label="停止" hidden>
+        <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" class="fill"/></svg>
+      </button>
+      <button id="btn-send" class="round-btn send" aria-label="发送" disabled>
+        <svg viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+      </button>
+    </div>
+    <input type="file" id="file-input" multiple hidden>
+  </footer>
+</div>
+
+<div id="drawer-mask" class="mask" hidden></div>
+<aside id="drawer" class="drawer" hidden>
+  <div class="drawer-head">
+    <div class="drawer-title">对话</div>
+    <button id="btn-drawer-new" class="pill-btn">＋ 新对话</button>
+  </div>
+  <div class="drawer-search">
+    <input id="search" type="search" placeholder="搜索对话" autocomplete="off">
+  </div>
+  <div class="segmented" id="source-filter">
+    <button data-source="" class="on">全部</button>
+    <button data-source="desktop">电脑</button>
+    <button data-source="mobile">手机</button>
+  </div>
+  <div id="session-list" class="session-list"></div>
+  <div class="drawer-foot" id="drawer-foot"></div>
+</aside>
+
+<div id="sheet-mask" class="mask" hidden></div>
+<div id="sheet" class="sheet" hidden></div>
+
+<div id="pair" class="pair" hidden>
+  <div class="pair-card">
+    <img src="/icons/icon-192.png" alt="" class="pair-logo">
+    <h1>连接到你的 Mac</h1>
+    <p>在 Mac 上双击桌面的「Claude手机连接」，配对链接会复制到剪贴板（会通过“通用剪贴板”同步到 iPhone）。</p>
+    <p>在 Safari 里直接打开那个链接，或者粘贴到下面：</p>
+    <input id="pair-input" type="password" placeholder="粘贴配对链接" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <button id="pair-btn" class="primary-btn">配对</button>
+    <div id="pair-error" class="pair-error"></div>
+  </div>
+</div>
+
+<div id="lightbox" class="lightbox" hidden><img alt=""></div>
+<div id="toast" class="toast" hidden></div>
+
+<script src="/vendor/marked.js"></script>
+<script src="/vendor/purify.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
