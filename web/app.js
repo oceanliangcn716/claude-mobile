@@ -301,6 +301,7 @@
   // ---------- 实时连接 ----------
   function connect() {
     S.es?.close();
+    if (document.hidden) { S.es = null; return; }
     const es = new EventSource(`/api/events?client=${encodeURIComponent(S.clientId)}`);
     S.es = es;
     es.addEventListener('delivery', e => { const d=JSON.parse(e.data); if(d.sessionId===S.cur?.id) toast(({held:'电脑需要确认这条手机消息',delivered:'电脑已批准消息',denied:'电脑拒绝了这条消息',expired:'电脑消息确认已过期'})[d.status] || d.status); });
@@ -322,6 +323,7 @@
   }
 
   async function recheck() {
+    if (document.hidden) return;
     try {
       const p = await api('/api/ping');
       if (!p.paired) return showPair();
@@ -1600,17 +1602,27 @@
     });
 
     // iPhone 切到后台再回来时，连接可能已经被系统断开，回来后补一次同步
-    let hiddenAt = 0;
+    const suspendConnection = () => {
+      saveDraft();
+      S.es?.close();
+      S.es = null;
+      clearTimeout(connTimer);
+    };
+    const resumeConnection = () => {
+      if (document.hidden || !S.boot) return;
+      if (!S.es || S.es.readyState === EventSource.CLOSED) connect();
+      // hello 会在恢复连接后重新订阅并补齐状态。
+    };
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
-        hiddenAt = Date.now();
-        saveDraft();
+        suspendConnection();
         return;
       }
-      if (!S.boot) return;
-      if (!S.es || S.es.readyState === EventSource.CLOSED) connect();
-      if (Date.now() - hiddenAt > 5000) resync();
+      resumeConnection();
     });
+    window.addEventListener('pagehide', suspendConnection);
+    window.addEventListener('pageshow', resumeConnection);
+    window.addEventListener('online', resumeConnection);
   }
 
   boot();
