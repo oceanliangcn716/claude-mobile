@@ -303,6 +303,7 @@
     S.es?.close();
     const es = new EventSource(`/api/events?client=${encodeURIComponent(S.clientId)}`);
     S.es = es;
+    es.addEventListener('delivery', e => { const d=JSON.parse(e.data); if(d.sessionId===S.cur?.id) toast(({held:'电脑需要确认这条手机消息',delivered:'电脑已批准消息',denied:'电脑拒绝了这条消息',expired:'电脑消息确认已过期'})[d.status] || d.status); });
     es.addEventListener('hello', () => {
       const again = S.everConnected;
       S.everConnected = true;
@@ -407,7 +408,7 @@
     c.total = d.total;
     if (d.actual !== undefined) c.actual = d.actual;
     renderStatus();
-    S.optimistic = S.optimistic.filter(o => !c.items.has(o.id));
+    S.optimistic = S.optimistic.filter(o => ![...c.items.values()].some(it => it.id === o.id || it.clientMessageId === o.id));
     renderMessages();
     renderLive();
   }
@@ -566,7 +567,7 @@
       S.cur.order.push(it.id);
     }
     if (r.engine) S.engine.set(id, r.engine);
-    S.optimistic = S.optimistic.filter(o => !S.cur.items.has(o.id));
+    S.optimistic = S.optimistic.filter(o => ![...S.cur.items.values()].some(it => it.id === o.id || it.clientMessageId === o.id));
     localStorage.setItem('cm.last', id);
     renderAll();
     scrollToBottom(true);
@@ -589,7 +590,7 @@
     Object.assign(c, { actual: r.actual || null, next: r.next || null, meta: r.meta, version: r.version, start: r.start, total: r.total, partial: r.partial || null });
     if (r.engine) S.engine.set(c.id, r.engine);
     else S.engine.delete(c.id);
-    S.optimistic = S.optimistic.filter(o => !c.items.has(o.id));
+    S.optimistic = S.optimistic.filter(o => ![...c.items.values()].some(it => it.id === o.id || it.clientMessageId === o.id));
     renderAll();
     if (stick) scrollToBottom(true);
   }
@@ -905,7 +906,7 @@
       if (o.images.length) n.append(thumbs(o.images.map(src => ({ src })), 'thumbs'));
       for (const f of o.files) n.append(h('span', { class: 'file-chip', html: ICON.file }, f));
       if (o.text) n.append(h('div', { class: 'bubble' }, o.text));
-      n.append(h('div', { class: 'msg-meta' }, '发送中…'));
+      n.append(h('div', { class: 'msg-meta' }, o.delivery === 'queued' ? '已投递到电脑，等待处理…' : '发送中…'));
       box.append(n);
     }
     const eng = c.id ? S.engine.get(c.id) : null;
@@ -1076,7 +1077,7 @@
     if (!c?.id) return { ...S.draft };
     const d = S.boot?.defaults || {};
     const a = actualOf(c) || {};
-    const n = c.next || {};
+    const n = (c.meta?.source === 'desktop' || c.meta?.live?.by === 'desktop') ? {} : c.next || {};
     return { model: n.model ?? a.model ?? d.model, effort: n.effort ?? a.effort ?? d.effort, permissionMode: n.permissionMode ?? d.permissionMode };
   }
 
@@ -1268,6 +1269,7 @@
     scrollToBottom();
     try {
       const r = await api('/api/send', { method: 'POST', body });
+      if (r.transport === 'desktop-peer') { opt.delivery = r.delivery; renderLive(); toast('已投递到电脑原会话'); }
       if (body.takeover) S.takeover.add(r.sessionId);
       if (!c?.id || r.sessionId !== c.id) {
         opt.sessionId = r.sessionId;
@@ -1375,7 +1377,10 @@
       const a = actualOf(c);
       if (c?.id && !c.isNew) kids.push(h('div', { class: 'kv' },
         h('div', {}, a?.model ? `${a.running ? '当前' : '上一轮'}实际：${modelLabel(a.model)} · 思考强度 ${effortLabel(a.effort)}${a.permissionMode ? ` · ${MODE_LABEL[a.permissionMode] || a.permissionMode}` : ''}` : '上一轮实际：未知（记录里没有）'),
-        h('div', {}, '下面的选择从手机发的下一轮开始生效，电脑上的设置不受影响。')));
+        h('div', {}, (c?.meta?.source === 'desktop' || c?.meta?.live?.by === 'desktop') ? '跟随电脑原会话。' : '下面的选择从手机发的下一轮开始生效，电脑上的设置不受影响。')));
+      if (c?.meta?.source === 'desktop' || c?.meta?.live?.by === 'desktop') {
+        kids.push(h('p', {class:'note'}, '手机消息投递到电脑原进程；模型、思考强度、停止和审批仍需在电脑操作。这里显示最近一轮记录的实际值。'));
+      } else {
       kids.push(h('div', { class: 'sec' }, '模型'), optList(S.boot.models.map(m => ({ value: m.value, label: m.label, note: m.note })), st.model, v => apply({ model: v })));
       const levels = S.boot.models.find(m => m.value === st.model)?.efforts;
       kids.push(h('div', { class: 'sec' }, '思考强度'));
@@ -1386,6 +1391,7 @@
       const sw = h('input', { type: 'checkbox', onchange: () => { saveDefault = sw.checked; if (saveDefault) apply({}); } });
       sw.checked = saveDefault;
       kids.push(h('div', { class: 'sec' }, '默认值'), h('label', { class: 'row-toggle' }, h('span', {}, '以后的新对话也用这些设置'), h('span', { class: 'switch' }, sw, h('span'))));
+      }
       const exp = h('input', { type: 'checkbox', onchange: () => { S.prefs.expandSteps = exp.checked; localStorage.setItem('cm.prefs', JSON.stringify(S.prefs)); } });
       exp.checked = !!S.prefs.expandSteps;
       kids.push(h('div', { class: 'sec' }, '显示'), h('label', { class: 'row-toggle' }, h('span', {}, '新的工具步骤默认展开'), h('span', { class: 'switch' }, exp, h('span'))));

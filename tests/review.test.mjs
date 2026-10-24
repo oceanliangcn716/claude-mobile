@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { UploadStore } from '../lib/uploads.mjs';
@@ -89,7 +89,20 @@ test('发送去重：同一 id 只执行一次，失败后允许重试', () => {
   assert.equal(l.claim('b'), null);
 });
 
-test('电脑进程持有对话：运行中拒绝；空闲时必须确认接管；页面拿到实际设置', { timeout: 40000 }, async t => {
+test('投递记录在服务重启后仍能去重', t => {
+  const dir=tmp('cm-ledger-');
+  t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const file=path.join(dir,'ledger.json');
+  const first=new SendLedger(60000,20,file);
+  first.claim('accepted');first.done('accepted',{sessionId:'s',delivery:'queued'});
+  first.claim('uncertain');
+  const restarted=new SendLedger(60000,20,file);
+  assert.equal(restarted.claim('accepted').result.delivery,'queued');
+  assert.equal(restarted.claim('uncertain').state,'pending');
+  assert.equal(fs.statSync(file).mode&0o777,0o600);
+});
+
+test('电脑通道不可用时拒绝接管；保留实际设置并禁止虚假的手机配置', { timeout: 40000 }, async t => {
   const dir = tmp('cm-own-');
   const reserve = net.createServer();
   await new Promise(r => reserve.listen(0, '127.0.0.1', r));
@@ -145,17 +158,17 @@ test('电脑进程持有对话：运行中拒绝；空闲时必须确认接管�
   const busy = await waitFor(async () => {
     const r = await send({ sessionId: sid, text: '手机补充', clientMessageId: crypto.randomUUID() });
     const j = await r.json();
-    return r.status === 409 && j.code === 'held_busy' ? j : null;
+    return r.status === 409 && j.code === 'desktop_unavailable' ? j : null;
   });
-  assert.ok(busy, '电脑运行中时必须拒绝手机写入');
+  assert.ok(busy, '不能投递到桌面原进程时必须拒绝另起进程');
 
   reg('idle');
   const idle = await waitFor(async () => {
     const r = await send({ sessionId: sid, text: '手机补充', clientMessageId: crypto.randomUUID() });
     const j = await r.json();
-    return r.status === 409 && j.code === 'takeover_required' ? j : null;
+    return r.status === 409 && j.code === 'desktop_unavailable' ? j : null;
   });
-  assert.ok(idle, '电脑空闲但开着时必须先确认接管');
+  assert.ok(idle, '电脑空闲也不能静默另起进程接管');
 
   const s = await (await fetch(`${url}/api/session?id=${sid}`)).json();
   assert.equal(s.actual.model, 'claude-opus-5-5');
@@ -164,7 +177,39 @@ test('电脑进程持有对话：运行中拒绝；空闲时必须确认接管�
 
   const bad = await fetch(url + '/api/configure', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: sid, effort: 'max' }) });
   assert.equal(bad.status, 400, '模型不支持的思考强度必须拒绝');
-  const ok = await (await fetch(url + '/api/configure', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: sid, effort: 'low' }) })).json();
-  assert.equal(ok.next.effort, 'low');
-  assert.equal(ok.next.model, 'claude-opus-5-5', '没改模型时沿用记录里实际的模型，不切到全局默认');
+  const unsupported = await fetch(url + '/api/configure', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: sid, effort: 'low' }) });
+  assert.equal(unsupported.status, 409);
+  assert.equal((await unsupported.json()).code, 'desktop_settings');
+
+  // The same HTTP send now reaches the existing process's inbox, even while
+  // busy. No SDK session is created, and a retry is not sent a second time.
+  const socket=path.join(dir,'desktop.sock');
+  let delivered=[];
+  const inbox=net.createServer(conn=>{let buf='';conn.on('data',chunk=>{buf+=chunk;let n;while((n=buf.indexOf('\n'))>=0){const line=buf.slice(0,n);buf=buf.slice(n+1);delivered.push(JSON.parse(line));}});});
+  await new Promise(r=>inbox.listen(socket,r));fs.chmodSync(socket,0o600);
+  t.after(()=>inbox.close());
+  const procStart=execFileSync('/bin/ps',['-o','lstart=','-p',String(holder.pid)],{encoding:'utf8',env:{...process.env,TZ:'UTC',LC_ALL:'C'}}).trim();
+  fs.writeFileSync(path.join(claudeDir,'sessions',`${holder.pid}.json`),JSON.stringify({pid:holder.pid,sessionId:sid,cwd,status:'busy',entrypoint:'claude-desktop-3p',procStart,messagingSocketPath:socket}));
+  const keyHash=crypto.createHash('sha256').update(socket).digest('hex');
+  fs.writeFileSync(path.join(claudeDir,'sessions',`${holder.pid}.${keyHash}.key`),JSON.stringify({peerToken:'synthetic-api-token',procStart}),{mode:0o600});
+  const messageId=crypto.randomUUID(),body={sessionId:sid,text:'API phone message',clientMessageId:messageId};
+  const first=await send(body);assert.equal(first.status,200);
+  assert.equal((await first.json()).transport,'desktop-peer');
+  await waitFor(()=>delivered.length===2);
+  const retry=await send(body);assert.equal((await retry.json()).duplicate,true);
+  assert.equal(delivered.length,2);
+  assert.equal((await (await fetch(url+'/api/state')).json()).engine.length,0);
+
+  // Simulate the desktop writing its received message and response. The phone
+  // reads that same transcript and settles the optimistic message by client id.
+  const transcript=path.join(projDir,`${sid}.jsonl`);
+  const previous=JSON.parse(fs.readFileSync(transcript,'utf8').trim().split('\n').at(-1)).uuid;
+  const receivedId=crypto.randomUUID();
+  fs.appendFileSync(transcript,[
+    {...base,type:'user',parentUuid:previous,uuid:receivedId,timestamp:new Date().toISOString(),message:{role:'user',content:'Another Claude session sent a message:\n'+delivered[1].message.content}},
+    {...base,type:'assistant',parentUuid:receivedId,uuid:crypto.randomUUID(),timestamp:new Date().toISOString(),message:{role:'assistant',model:'claude-opus-5-5',content:[{type:'text',text:'API_SYNC_OK'}]}}
+  ].map(row=>JSON.stringify(row)).join('\n')+'\n');
+  const synced=await (await fetch(`${url}/api/session?id=${sid}`)).json();
+  assert.ok(synced.items.some(item=>item.clientMessageId===messageId&&item.text==='API phone message'));
+  assert.ok(synced.items.some(item=>item.text==='API_SYNC_OK'));
 });

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Claude 手机入口：手机浏览器遥控这台 Mac 上的 Claude Code。
 // 看：实时读取 ~/.claude/projects 里所有对话（电脑桌面 App 的也在内）。
-// 做：手机发的消息交给本机 Claude Agent SDK 引擎执行，沿用 ~/.claude/settings.json 的中转和登录。
+// 做：电脑对话投递给桌面原进程；手机新建对话使用本机 Agent SDK。
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -18,6 +18,7 @@ import { BlobStore, ATTACH_HEAD } from './lib/transcript.mjs';
 import { UploadStore, UPLOAD_LIMIT, MAX_ATTACHMENTS, MAX_TOTAL, publicUpload } from './lib/uploads.mjs';
 import { HttpError, sendJson, readJson, readBody, readJsonFile, writeFileAtomic, createLogger, addSecrets, redact } from './lib/util.mjs';
 import { SettingsStore, SendLedger } from './lib/state.mjs';
+import { DesktopPeer } from './lib/peer.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
@@ -114,11 +115,12 @@ addSecrets(Object.entries({ ...process.env, ...(readJsonFile(path.join(CLAUDE_DI
 
 const auth = new Auth(PRIVATE);
 const sessionSettings = new SettingsStore(path.join(PRIVATE, 'session-settings.json'));
-const sendLedger = new SendLedger();
+const sendLedger = new SendLedger(24 * 3600 * 1000, 2000, path.join(PRIVATE,'send-ledger.json'));
 const uploads = new UploadStore(path.join(PRIVATE, 'uploads'));
 const blobs = new BlobStore();
 const engine = new Engine({ log, uploadsDir: uploads.root, env: engineEnv() });
 const hub = new Hub({ claudeDir: CLAUDE_DIR, privateDir: PRIVATE, workspaceDir: WORKSPACE, engine, blobs, log });
+const peer = new DesktopPeer({claudeDir:CLAUDE_DIR,onStatus:status=>hub.broadcast('delivery',status)});
 
 // ---------- 安全检查 ----------
 
@@ -235,6 +237,17 @@ function titleFrom(text) {
 }
 
 async function handleSend(p) {
+  const clientId = typeof p.clientMessageId === 'string' && isSessionId(p.clientMessageId) ? p.clientMessageId : crypto.randomUUID();
+  const prior = sendLedger.claim(clientId);
+  if (prior?.state === 'done') return {...prior.result,duplicate:true};
+  if (prior) throw new HttpError(409, '这条消息正在投递，请等待电脑确认', {code:'in_flight'});
+  try {
+    const result=await performSend({...p,clientMessageId:clientId});
+    sendLedger.done(clientId,result);return result;
+  } catch(e) {sendLedger.fail(clientId);throw e;}
+}
+
+async function performSend(p) {
   const text = typeof p.text === 'string' ? p.text : '';
   if (text.length > 100000) throw new HttpError(413, '消息太长了');
   const ids = Array.isArray(p.attachments) ? p.attachments : [];
@@ -249,6 +262,7 @@ async function handleSend(p) {
   let resume = false;
   let title;
   let releaseWhenIdle = false;
+  let desktopTarget = null;
   if (sessionId) {
     if (!isSessionId(sessionId)) throw new HttpError(400, '无效的对话');
     hub.refreshLive();
@@ -257,7 +271,11 @@ async function handleSend(p) {
     // 同一时间只允许一个进程写这条对话。电脑（桌面 App / 终端）有进程开着它时：
     // 正在运行 → 拒绝（手机无法插进电脑正在执行的任务）；空闲 → 需要用户明确确认“接管”。
     const holder = meta.live;
-    if (holder) {
+    if (meta.source === 'desktop' || holder?.by === 'desktop') {
+      desktopTarget = peer.target(sessionId);
+      if (!desktopTarget) throw new HttpError(409, '请先在电脑 Claude 里打开这条对话；手机不会另起进程接管', {code:'desktop_unavailable'});
+    }
+    if (holder && !desktopTarget) {
       const where = holder.by === 'terminal' ? '终端' : '电脑 Claude 应用';
       if (holder.status !== 'idle') throw new HttpError(409, `${where}正在执行这条对话，等它完成后再从手机继续`, { code: 'held_busy', by: holder.by });
       if (!p.takeover) throw new HttpError(409, `${where}里开着这条对话`, { code: 'takeover_required', by: holder.by });
@@ -271,15 +289,9 @@ async function handleSend(p) {
   } else {
     cwd = resolveCwd(p.cwd || config.defaults.cwd);
   }
-  const settings = pickSettings(p, sessionId ? baseFor(sessionId) : config.defaults);
+  const settings = desktopTarget ? {} : pickSettings(p, sessionId ? baseFor(sessionId) : config.defaults);
 
-  // 断线重发：同一个 clientMessageId 只执行一次
-  const clientId = typeof p.clientMessageId === 'string' && isSessionId(p.clientMessageId) ? p.clientMessageId : null;
-  if (clientId) {
-    const prior = sendLedger.claim(clientId);
-    if (prior?.state === 'done') return { ...prior.result, duplicate: true };
-    if (prior) throw new HttpError(409, '这条消息正在发送', { code: 'in_flight' });
-  }
+  const clientId = p.clientMessageId;
   try {
     if (!sessionId) {
       sessionId = crypto.randomUUID();
@@ -292,13 +304,16 @@ async function handleSend(p) {
   const body = [text.trim(), notes.length ? `${ATTACH_HEAD}\n${notes.join('\n')}` : ''].filter(Boolean).join('\n\n');
   content.push({ type: 'text', text: body });
 
+  if (desktopTarget) {
+    const result = await peer.send(desktopTarget, body, clientId || crypto.randomUUID());
+    hub.refresh(sessionId);
+    return result;
+  }
   engine.send({ sessionId, resume, cwd, content, title, uuid: clientId || undefined, releaseWhenIdle, ...settings });
   sessionSettings.set(sessionId, settings);
   const result = { ok: true, sessionId };
-  if (clientId) sendLedger.done(clientId, result);
   return result;
   } catch (e) {
-    if (clientId) sendLedger.fail(clientId);
     throw e;
   }
 }
@@ -307,6 +322,8 @@ async function handleConfigure(p) {
   const id = isSessionId(p.sessionId) ? p.sessionId : null;
   const settings = pickSettings(p, id ? baseFor(id) : config.defaults);
   if (id) {
+    const meta = await hub.meta(id);
+    if (meta?.source === 'desktop' || meta?.live?.by === 'desktop') throw new HttpError(409, '电脑原会话的模型和思考强度请在电脑调整，手机会同步显示实际值', {code:'desktop_settings'});
     if (engine.has(id)) await engine.configure(id, settings);
     sessionSettings.set(id, settings);
   }
@@ -438,6 +455,8 @@ async function route(req, res) {
 
   if (r === '/api/stop' && req.method === 'POST') {
     const p = await readJson(req);
+    const meta = await hub.meta(p.sessionId);
+    if (meta?.source === 'desktop' || meta?.live?.by === 'desktop') throw new HttpError(409, '这条通道暂不支持停止电脑任务，请在电脑操作');
     await engine.stop(p.sessionId);
     return sendJson(res, 200, { ok: true });
   }
@@ -520,6 +539,7 @@ function shutdown(signal) {
   log.info('shutting down', signal);
   clearInterval(addressTimer);
   hub.stop();
+  void peer.close();
   engine.shutdown();
   listeners.closeAll();
   setTimeout(() => process.exit(0), 1500).unref();
