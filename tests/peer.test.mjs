@@ -36,6 +36,9 @@ test('peer delivery authenticates to the original process without bypassing appr
   await assert.rejects(peer.send(target,'again',crypto.randomUUID()),/会话已变化/);
   identity={comm:'/test/claude',start:'start'};fs.chmodSync(keyFile,0o644);
   await assert.rejects(peer.send(target,'again',crypto.randomUUID()),/权限异常/);
+  fs.chmodSync(keyFile,0o600);fs.writeFileSync(keyFile,'{malformed-private-data');
+  await assert.rejects(peer.send(target,'again',crypto.randomUUID()),error=>
+    error.message.includes('认证数据无法读取')&&!error.message.includes('malformed-private-data'));
 });
 
 test('phone peer messages keep their message id and attachment cards in the transcript',()=>{
