@@ -52,5 +52,5 @@ done
 
 sleep 2
 running=$(curl -fsS --max-time 3 "http://127.0.0.1:$port/api/ping" | sed -nE 's/.*"build":"([^"]+)".*/\1/p')
-echo "部署版本：$build；服务报告的运行版本：${running:-未知}"
+echo "部署版本：${build}；服务报告的运行版本：${running:-未知}"
 [ "$running" = "$build" ] || { echo '运行版本和部署版本不一致，查看日志'; exit 1; }
