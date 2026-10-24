@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { renameSession } from '@anthropic-ai/claude-agent-sdk';
 import { Auth } from './lib/auth.mjs';
 import { Listeners, lanAddresses } from './lib/net.mjs';
@@ -15,7 +16,8 @@ import { Engine, PERMISSION_MODES, EFFORTS } from './lib/engine.mjs';
 import { Hub, isSessionId } from './lib/hub.mjs';
 import { BlobStore, ATTACH_HEAD } from './lib/transcript.mjs';
 import { UploadStore, UPLOAD_LIMIT, MAX_ATTACHMENTS, MAX_TOTAL, publicUpload } from './lib/uploads.mjs';
-import { HttpError, sendJson, readJson, readBody, readJsonFile, writeFileAtomic, createLogger } from './lib/util.mjs';
+import { HttpError, sendJson, readJson, readBody, readJsonFile, writeFileAtomic, createLogger, addSecrets, redact } from './lib/util.mjs';
+import { SettingsStore, SendLedger } from './lib/state.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
@@ -25,6 +27,19 @@ const WEB = path.join(ROOT, 'web');
 const WORKSPACE = path.join(ROOT, 'mobile-workspace');
 const CONFIG_FILE = path.join(ROOT, 'config.json');
 const VERSION = readJsonFile(path.join(ROOT, 'package.json'), {}).version || 'dev';
+// 实际运行的是哪一份代码：Git 仓库里读提交号，部署出来的目录读 BUILD 文件
+const BUILD = (() => {
+  try {
+    const head = execFileSync('git', ['-C', ROOT, 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    const dirty = execFileSync('git', ['-C', ROOT, 'status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return head + (dirty ? '-modified' : '');
+  } catch {}
+  try {
+    return fs.readFileSync(path.join(ROOT, 'BUILD'), 'utf8').trim() || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+})();
 
 fs.mkdirSync(PRIVATE, { recursive: true, mode: 0o700 });
 fs.mkdirSync(WORKSPACE, { recursive: true });
@@ -45,12 +60,36 @@ function saveConfig() {
   writeFileAtomic(CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, 0o644);
 }
 
-// 使用通用别名；自定义服务商可在 config.json 的 models 中填写自己的模型 ID。
-const MODELS = config.models || [
+// 模型菜单：config.json 的 models 优先（自定义服务商自己填）；否则启动时读本机 Claude Code 的模型目录和
+// 每个模型支持的思考强度；都拿不到时用通用别名。菜单里有，不代表你的服务商一定支持，失败会在页面显示错误。
+const FALLBACK_MODELS = [
   { value: 'opus', label: 'Opus', note: '' },
   { value: 'sonnet', label: 'Sonnet', note: '' },
   { value: 'haiku', label: 'Haiku', note: '' },
 ];
+let models = (config.models || FALLBACK_MODELS).map(m => ({ ...m, source: config.models ? 'config' : 'fallback' }));
+
+function modelInfo(value) {
+  return models.find(m => m.value === value) || null;
+}
+
+async function loadModels() {
+  if (config.models) return;
+  try {
+    const list = await engine.fetchModels(HOME);
+    if (!list?.length) return;
+    models = list.map(m => ({
+      value: m.value,
+      label: m.displayName || m.value,
+      note: m.description || '',
+      efforts: m.supportsEffort === false ? [] : m.supportedEffortLevels?.length ? m.supportedEffortLevels : undefined,
+      source: 'claude-code',
+    }));
+    log.info('models loaded', models.map(m => m.value).join(','));
+  } catch (e) {
+    log.warn('load models failed', e.message);
+  }
+}
 
 // 引擎进程的环境：去掉从桌面 App 继承来的会话变量，补上桌面第三方模式用的开关。
 function engineEnv() {
@@ -69,7 +108,13 @@ function engineEnv() {
   };
 }
 
+// 已知密钥登记进脱敏表：日志和返回页面的错误里都不会出现
+addSecrets(Object.entries({ ...process.env, ...(readJsonFile(path.join(CLAUDE_DIR, 'settings.json'), {}).env || {}) })
+  .filter(([k]) => /TOKEN|KEY|SECRET|PASSWORD/i.test(k)).map(([, v]) => v));
+
 const auth = new Auth(PRIVATE);
+const sessionSettings = new SettingsStore(path.join(PRIVATE, 'session-settings.json'));
+const sendLedger = new SendLedger();
 const uploads = new UploadStore(path.join(PRIVATE, 'uploads'));
 const blobs = new BlobStore();
 const engine = new Engine({ log, uploadsDir: uploads.root, env: engineEnv() });
@@ -162,12 +207,26 @@ function resolveCwd(value) {
   return p;
 }
 
+// p 里显式给出的设置覆盖 base；思考强度按所选模型实际支持的档位校验。
 function pickSettings(p, base) {
   const out = { model: base.model, effort: base.effort, permissionMode: base.permissionMode };
   if (typeof p.model === 'string' && /^[\w.\-[\]]{1,80}$/.test(p.model)) out.model = p.model;
   if (EFFORTS.includes(p.effort)) out.effort = p.effort;
   if (PERMISSION_MODES.includes(p.permissionMode)) out.permissionMode = p.permissionMode;
+  const levels = modelInfo(out.model)?.efforts;
+  if (levels && out.effort && !levels.includes(out.effort)) {
+    if (EFFORTS.includes(p.effort)) throw new HttpError(400, levels.length ? `${out.model} 不支持“${p.effort}”思考强度，可选：${levels.join('/')}` : `${out.model} 不支持调节思考强度`);
+    out.effort = levels.length ? levels[levels.length > 1 ? 1 : 0] : null;
+  }
   return out;
+}
+
+// 继续已有对话时的设置基准：手机上为这条对话选过的 > 记录里最近一轮实际用的 > 全局默认
+function baseFor(id) {
+  const actual = hub.actualSettings(id) || {};
+  const chosen = sessionSettings.get(id) || {};
+  const pick = k => chosen[k] ?? actual[k] ?? config.defaults[k];
+  return { model: pick('model'), effort: pick('effort'), permissionMode: chosen.permissionMode ?? config.defaults.permissionMode };
 }
 
 function titleFrom(text) {
@@ -185,48 +244,78 @@ async function handleSend(p) {
   if (atts.reduce((n, a) => n + a.size, 0) > MAX_TOTAL) throw new HttpError(413, '附件总共不能超过 40 MB');
   if (!text.trim() && !atts.length) throw new HttpError(400, '请输入内容');
 
-  const settings = pickSettings(p, config.defaults);
   let sessionId = p.sessionId || null;
   let cwd;
   let resume = false;
   let title;
-  let forkedFrom = null;
+  let releaseWhenIdle = false;
   if (sessionId) {
     if (!isSessionId(sessionId)) throw new HttpError(400, '无效的对话');
+    hub.refreshLive();
+    const meta = await hub.meta(sessionId);
+    if (!meta) throw new HttpError(404, '找不到这条对话');
+    // 同一时间只允许一个进程写这条对话。电脑（桌面 App / 终端）有进程开着它时：
+    // 正在运行 → 拒绝（手机无法插进电脑正在执行的任务）；空闲 → 需要用户明确确认“接管”。
+    const holder = meta.live;
+    if (holder) {
+      const where = holder.by === 'terminal' ? '终端' : '电脑 Claude 应用';
+      if (holder.status !== 'idle') throw new HttpError(409, `${where}正在执行这条对话，等它完成后再从手机继续`, { code: 'held_busy', by: holder.by });
+      if (!p.takeover) throw new HttpError(409, `${where}里开着这条对话`, { code: 'takeover_required', by: holder.by });
+      log.info('takeover', sessionId, holder.by);
+    }
     if (!engine.has(sessionId)) {
-      const meta = await hub.meta(sessionId);
-      if (!meta) throw new HttpError(404, '找不到这条对话');
-      // 电脑上的对话也直接接着写（同一条记录），手机发的消息接在原对话后面。
       cwd = meta.cwd ? resolveCwd(meta.cwd) : HOME;
       resume = true;
+      releaseWhenIdle = meta.source !== 'mobile';
     }
   } else {
-    sessionId = crypto.randomUUID();
     cwd = resolveCwd(p.cwd || config.defaults.cwd);
-    title = titleFrom(text) === '手机对话' && atts.length ? '图片' : titleFrom(text);
-    hub.markOwn(sessionId, { title });
   }
+  const settings = pickSettings(p, sessionId ? baseFor(sessionId) : config.defaults);
 
+  // 断线重发：同一个 clientMessageId 只执行一次
+  const clientId = typeof p.clientMessageId === 'string' && isSessionId(p.clientMessageId) ? p.clientMessageId : null;
+  if (clientId) {
+    const prior = sendLedger.claim(clientId);
+    if (prior?.state === 'done') return { ...prior.result, duplicate: true };
+    if (prior) throw new HttpError(409, '这条消息正在发送', { code: 'in_flight' });
+  }
+  try {
+    if (!sessionId) {
+      sessionId = crypto.randomUUID();
+      title = titleFrom(text) === '手机对话' && atts.length ? '图片' : titleFrom(text);
+      hub.markOwn(sessionId, { title });
+    }
   const content = [];
   for (const a of atts) if (a.kind === 'image') content.push(uploads.imageBlock(a));
   const notes = atts.map(a => `- ${a.kind === 'image' ? '图片' : '文件'} ${a.name}：${a.file}`);
   const body = [text.trim(), notes.length ? `${ATTACH_HEAD}\n${notes.join('\n')}` : ''].filter(Boolean).join('\n\n');
   content.push({ type: 'text', text: body });
 
-  engine.send({ sessionId, resume, cwd, content, title, uuid: typeof p.clientMessageId === 'string' && isSessionId(p.clientMessageId) ? p.clientMessageId : undefined, ...settings });
-  return { ok: true, sessionId, forkedFrom };
+  engine.send({ sessionId, resume, cwd, content, title, uuid: clientId || undefined, releaseWhenIdle, ...settings });
+  sessionSettings.set(sessionId, settings);
+  const result = { ok: true, sessionId };
+  if (clientId) sendLedger.done(clientId, result);
+  return result;
+  } catch (e) {
+    if (clientId) sendLedger.fail(clientId);
+    throw e;
+  }
 }
 
 async function handleConfigure(p) {
-  const id = p.sessionId;
-  const settings = pickSettings(p, config.defaults);
-  if (id && engine.has(id)) await engine.configure(id, settings);
+  const id = isSessionId(p.sessionId) ? p.sessionId : null;
+  const settings = pickSettings(p, id ? baseFor(id) : config.defaults);
+  if (id) {
+    if (engine.has(id)) await engine.configure(id, settings);
+    sessionSettings.set(id, settings);
+  }
   if (p.saveDefault || !id) {
     config.defaults = { ...config.defaults, ...settings };
     if (typeof p.cwd === 'string') config.defaults.cwd = p.cwd.startsWith(HOME) ? `~${p.cwd.slice(HOME.length)}` : p.cwd;
     saveConfig();
   }
-  return { ok: true, defaults: config.defaults, engine: id ? engine.state(id) : null };
+  return { ok: true, defaults: config.defaults, engine: id ? engine.state(id) : null, next: id ? sessionSettings.get(id) : null };
 }
 
 function serveFile(res, file, mime, name, inline) {
@@ -282,7 +371,7 @@ async function route(req, res) {
     if (origin && origin !== `http://${req.headers.host}`) return sendJson(res, 403, { error: '来源不匹配' });
   }
 
-  if (r === '/api/ping') return sendJson(res, 200, { ok: true, paired: authorized(req, res), version: VERSION });
+  if (r === '/api/ping') return sendJson(res, 200, { ok: true, paired: authorized(req, res), version: VERSION, build: BUILD });
 
   if (r === '/api/pair' && req.method === 'POST') {
     const p = await readJson(req, 4096);
@@ -304,7 +393,8 @@ async function route(req, res) {
       port: config.port,
       addresses: listeners.addresses.filter(a => a !== '127.0.0.1'),
       defaults: config.defaults,
-      models: MODELS,
+      build: BUILD,
+      models,
       efforts: EFFORTS,
       modes: PERMISSION_MODES,
       projects: await hub.projects(),
@@ -323,7 +413,7 @@ async function route(req, res) {
     const meta = await hub.meta(id);
     if (!meta) throw new HttpError(404, '找不到这条对话');
     const data = await hub.open(id);
-    return sendJson(res, 200, { meta, ...data, engine: engine.state(id), partial: engine.sessions.get(id)?.partialPayload() ?? null });
+    return sendJson(res, 200, { meta, ...data, actual: hub.actualSettings(id), next: sessionSettings.get(id), engine: engine.state(id), partial: engine.sessions.get(id)?.partialPayload() ?? null });
   }
 
   if (r === '/api/session/older' && req.method === 'GET') {
@@ -402,7 +492,8 @@ async function handler(req, res) {
   } catch (e) {
     const status = e instanceof HttpError ? e.status : 500;
     if (status >= 500) log.error('request failed', req.method, req.url, e);
-    if (!res.headersSent) sendJson(res, status, { error: e.message || '出错了', ...(e.extra || {}) });
+    // 内部错误不把原始信息返回页面（可能含路径、地址等），详情只进脱敏后的日志
+    if (!res.headersSent) sendJson(res, status, { error: status >= 500 ? 'Mac 上的服务出错了，详情见日志' : redact(e.message || '出错了'), ...(e.extra || {}) });
     else res.end();
   }
 }
@@ -419,7 +510,8 @@ async function syncAddresses() {
 hub.start();
 await syncAddresses();
 const addressTimer = setInterval(() => syncAddresses().catch(e => log.warn('address sync failed', e.message)), 10000);
-log.info(`Claude Mobile ${VERSION} ready`, listeners.addresses.map(a => `http://${a}:${config.port}/`).join(' '));
+loadModels();
+log.info(`Claude Mobile ${VERSION} (${BUILD}) ready`, listeners.addresses.map(a => `http://${a}:${config.port}/`).join(' '));
 
 let shuttingDown = false;
 function shutdown(signal) {

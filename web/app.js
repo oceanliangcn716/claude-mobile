@@ -158,7 +158,8 @@
     cur: null,
     openToken: 0,
     draft: null,
-    sessionSettings: new Map(),
+    takeover: new Set(),
+    retry: null,
     atts: [],
     optimistic: [],
     expanded: new Set(),
@@ -404,6 +405,8 @@
     }
     c.version = d.version;
     c.total = d.total;
+    if (d.actual !== undefined) c.actual = d.actual;
+    renderStatus();
     S.optimistic = S.optimistic.filter(o => !c.items.has(o.id));
     renderMessages();
     renderLive();
@@ -509,7 +512,7 @@
     const b = S.boot;
     if (!b) return;
     const addr = b.addresses?.length ? b.addresses.map(a => `${a}:${b.port}`).join('、') : `端口 ${b.port}`;
-    $('#drawer-foot').textContent = `Mac：${addr} · v${b.version}${S.es?.readyState === 1 ? ' · 实时连接中' : ''}`;
+    $('#drawer-foot').textContent = `Mac：${addr} · v${b.version}（${b.build || "unknown"}）${S.es?.readyState === 1 ? ' · 实时连接中' : ''}`;
   }
 
   function openDrawer() {
@@ -557,7 +560,7 @@
       throw e;
     }
     if (token !== S.openToken) return;
-    Object.assign(S.cur, { loading: false, meta: r.meta, version: r.version, start: r.start, total: r.total, partial: r.partial || null });
+    Object.assign(S.cur, { loading: false, actual: r.actual || null, next: r.next || null, meta: r.meta, version: r.version, start: r.start, total: r.total, partial: r.partial || null });
     for (const it of r.items) {
       S.cur.items.set(it.id, it);
       S.cur.order.push(it.id);
@@ -583,7 +586,7 @@
     if (token !== S.openToken || S.cur !== c) return;
     c.items = new Map(r.items.map(it => [it.id, it]));
     c.order = r.items.map(it => it.id);
-    Object.assign(c, { meta: r.meta, version: r.version, start: r.start, total: r.total, partial: r.partial || null });
+    Object.assign(c, { actual: r.actual || null, next: r.next || null, meta: r.meta, version: r.version, start: r.start, total: r.total, partial: r.partial || null });
     if (r.engine) S.engine.set(c.id, r.engine);
     else S.engine.delete(c.id);
     S.optimistic = S.optimistic.filter(o => !c.items.has(o.id));
@@ -618,8 +621,13 @@
   }
 
   // ---------- 渲染：顶栏 / 横幅 ----------
-  function isForeign(meta) {
-    return !!meta && !S.engine.has(meta.id) && (meta.source === 'desktop' || meta.live?.by === 'desktop' || meta.live?.by === 'terminal');
+  // 电脑（桌面 App / 终端）有进程开着这条对话时返回它：{ by, status }
+  function holderOf(meta) {
+    return meta && !S.engine.has(meta.id) ? meta.live || null : null;
+  }
+
+  function whereOf(meta) {
+    return meta?.live?.by === 'terminal' || meta?.source === 'terminal' ? '终端' : '电脑 Claude 应用';
   }
 
   function curBusy() {
@@ -653,12 +661,15 @@
     b.replaceChildren();
     b.hidden = true;
     if (!m || S.cur.isNew) return;
+    const holder = holderOf(m);
+    const where = whereOf(m);
     let text = null;
-    if (isForeign(m)) {
-      const where = m.source === 'terminal' || m.live?.by === 'terminal' ? '终端' : '电脑 Claude 应用';
-      text = `这是${where}里的对话，${m.live ? '正在实时同步显示' : '内容和电脑一致'}。手机发的消息会直接接在这条对话后面。电脑 App 里已经打开的这条对话不会自动刷新出手机的新内容，最好别两边同时发。`;
-    } else if (m.forkedFrom) {
-      text = '这条对话是从电脑上的对话复制过来的，之后的内容只在手机这边（电脑浏览器打开这个网页也能看到）。';
+    if (holder && holder.status !== 'idle') {
+      text = `${where}正在执行这条对话，这里实时显示进度。手机不能插进电脑正在运行的任务：补充、停止、审批请在电脑上操作，等它完成后可以从手机接着发。`;
+    } else if (holder) {
+      text = `${where}里开着这条对话（空闲）。从手机发消息前会请你确认接管。`;
+    } else if (m.source !== 'mobile' && !S.engine.has(m.id)) {
+      text = '这是电脑上的对话。手机发的消息会接在同一条对话后面；之后回电脑继续前，要在电脑上重新打开这条对话才能看到手机的内容。';
     }
     if (!text) return;
     b.hidden = false;
@@ -1053,14 +1064,28 @@
   }
 
   // ---------- 输入框 ----------
-  function settingsFor(c) {
+  // 实际在用：手机引擎正在运行时取引擎状态，否则取对话记录里最近一轮实际用的
+  function actualOf(c) {
     const eng = c?.id ? S.engine.get(c.id) : null;
-    if (eng) return { model: eng.model, effort: eng.effort, permissionMode: eng.permissionMode };
-    return { ...S.draft, ...(c?.id ? S.sessionSettings.get(c.id) || {} : {}) };
+    if (eng && eng.state !== 'closed') return { model: eng.model, effort: eng.effort, permissionMode: eng.permissionMode, running: true };
+    return c?.actual || null;
+  }
+
+  // 下一轮会用的：新对话用草稿；已有对话用为它选过的，其次沿用记录里的，再次全局默认（和服务端规则一致）
+  function nextOf(c) {
+    if (!c?.id) return { ...S.draft };
+    const d = S.boot?.defaults || {};
+    const a = actualOf(c) || {};
+    const n = c.next || {};
+    return { model: n.model ?? a.model ?? d.model, effort: n.effort ?? a.effort ?? d.effort, permissionMode: n.permissionMode ?? d.permissionMode };
+  }
+
+  function effortLabel(e) {
+    return e ? EFFORT_LABEL[e] || e : '默认';
   }
 
   function modelLabel(v) {
-    return S.boot?.models.find(m => m.value === v)?.label || v || '默认模型';
+    return S.boot?.models.find(m => m.value === v)?.label || v || '未知';
   }
 
   function renderComposer() {
@@ -1077,9 +1102,18 @@
     const c = S.cur;
     const line = $('#statusline');
     const eng = c?.id ? S.engine.get(c.id) : null;
-    const st = settingsFor(c);
-    const parts = [`模型 ${modelLabel(st.model)}`, `思考强度 ${EFFORT_LABEL[st.effort] || st.effort || '默认'}`, MODE_LABEL[st.permissionMode] || st.permissionMode];
-    line.replaceChildren(parts.join(' · '));
+    const next = nextOf(c);
+    const desc = st => `模型 ${modelLabel(st.model)} · 思考强度 ${effortLabel(st.effort)}`;
+    line.replaceChildren();
+    if (!c?.id) line.append(`${desc(next)} · ${MODE_LABEL[next.permissionMode] || next.permissionMode}`);
+    else {
+      const a = actualOf(c);
+      if (a?.running) line.append(`当前 ${desc(a)} · ${MODE_LABEL[a.permissionMode] || a.permissionMode}`);
+      else if (a?.model) {
+        line.append(`上一轮 ${desc(a)}`);
+        if (next.model !== a.model || (next.effort || null) !== (a.effort || null)) line.append(` → 下一轮 ${desc(next)}`);
+      } else line.append(`模型 未知 · 下一轮 ${desc(next)}`);
+    }
     if (eng?.error && !eng.busy) line.append(' · ', h('span', { class: 'err' }, eng.error));
     else if (eng?.retry && eng.busy) line.append(' · ', h('span', { class: 'warn' }, `${eng.retry.error}，重试中`));
     else if (eng?.busy && eng.turnStartedAt) line.append(` · 已运行 ${duration(Date.now() - eng.turnStartedAt)}`);
@@ -1205,12 +1239,18 @@
     const atts = S.atts.filter(a => a.status === 'ready');
     if (!text.trim() && !atts.length) return;
     const c = S.cur;
-    const body = { text, attachments: atts.map(a => a.id), clientMessageId: uuid(), ...settingsFor(c), ...extra };
-    if (c?.id) body.sessionId = c.id;
-    else body.cwd = S.draft.cwd;
+    // 断线后重发同样的内容沿用同一个 id，服务端据此去重，不会重复执行
+    const sig = hash(`${c?.id || ''}\n${text}\n${atts.map(a => a.id).join(',')}`);
+    const clientMessageId = S.retry?.sig === sig ? S.retry.id : uuid();
+    S.retry = null;
+    const body = { text, attachments: atts.map(a => a.id), clientMessageId, ...extra };
+    if (c?.id) {
+      body.sessionId = c.id;
+      if (S.takeover.has(c.id)) body.takeover = true;
+    } else Object.assign(body, S.draft);
     const opt = {
       id: body.clientMessageId,
-      sessionId: extra.fork ? null : c?.id || null,
+      sessionId: c?.id || null,
       text: text.trim(),
       images: atts.filter(a => a.kind === 'image').map(a => a.url),
       files: atts.filter(a => a.kind !== 'image').map(a => a.name),
@@ -1228,6 +1268,7 @@
     scrollToBottom();
     try {
       const r = await api('/api/send', { method: 'POST', body });
+      if (body.takeover) S.takeover.add(r.sessionId);
       if (!c?.id || r.sessionId !== c.id) {
         opt.sessionId = r.sessionId;
         await openSession(r.sessionId, { keepOptimistic: true });
@@ -1242,19 +1283,22 @@
       updateSend();
       renderLive();
       renderEmpty();
-      if (e.status === 409 && e.data?.code === 'fork_required') return confirmFork();
-      toast(e.message, 4000);
+      if (e.status === 0) S.retry = { sig, id: clientMessageId };
+      if (e.status === 409 && e.data?.code === 'takeover_required') return confirmTakeover();
+      if (e.status === 409 && e.data?.code === 'held_busy') S.takeover.delete(c.id);
+      toast(e.status === 0 ? `${e.message}。内容已放回输入框，再点发送不会重复执行` : e.message, 4000);
     }
   }
 
-  function confirmFork() {
+  function confirmTakeover() {
     const m = S.cur?.meta;
-    const where = m?.source === 'terminal' || m?.live?.by === 'terminal' ? '终端' : '电脑 Claude 应用';
+    const where = whereOf(m);
     openSheet([
-      h('h3', {}, '在手机上继续这条对话？'),
-      h('p', { class: 'note' }, `这条对话在${where}里，由电脑那边的 Claude 进程负责，手机不能直接往里插话。`),
-      h('p', { class: 'note' }, '继续的话，会复制完整历史开一条新的手机对话（标题后面带“（手机）”），Claude 记得之前的所有内容。电脑上的原对话不受影响；之后两边各走各的。'),
-      h('button', { class: 'primary-btn', onclick: () => { closeSheet(); send({ fork: true }); } }, '复制并继续'),
+      h('h3', {}, '从手机接管这条对话？'),
+      h('p', { class: 'note' }, `${where}里开着这条对话（现在空闲）。接管后，手机发的消息会接在同一条对话后面，Claude 记得之前的全部内容。`),
+      h('p', { class: 'note' }, `${where}里已经打开的这条对话不会自动刷新出手机的内容。之后要回电脑继续，请先在电脑上重新打开它（或退出应用再打开），否则电脑会从旧内容接着写，对话会分叉。`),
+      h('p', { class: 'note' }, '电脑那边一旦开始运行这条对话，手机会停止接管，需要等它完成。'),
+      h('button', { class: 'primary-btn', onclick: () => { closeSheet(); S.takeover.add(S.cur.id); send(); } }, '接管并发送'),
       h('button', { class: 'secondary-btn', onclick: closeSheet }, '取消'),
     ]);
   }
@@ -1295,24 +1339,22 @@
   function openSettings() {
     const c = S.cur;
     const eng = c?.id ? S.engine.get(c.id) : null;
-    const foreign = isForeign(c?.meta);
-    const st = settingsFor(c);
+    const st = nextOf(c);
     let saveDefault = false;
     const apply = async patch => {
-      const next = { ...st, ...patch };
-      Object.assign(st, patch);
       try {
-        if (eng) {
-          const r = await api('/api/configure', { method: 'POST', body: { sessionId: c.id, ...next, saveDefault } });
+        if (c?.id && !c.isNew) {
+          const r = await api('/api/configure', { method: 'POST', body: { sessionId: c.id, ...patch, saveDefault } });
           if (r.engine) S.engine.set(c.id, r.engine);
-        } else if (c?.id && !c.isNew) {
-          S.sessionSettings.set(c.id, next);
-          if (saveDefault) await api('/api/configure', { method: 'POST', body: { ...next } });
+          c.next = r.next;
+          if (saveDefault) S.boot.defaults = r.defaults;
         } else {
           Object.assign(S.draft, patch);
-          if (saveDefault) await api('/api/configure', { method: 'POST', body: { ...S.draft } });
+          const info = S.boot.models.find(m => m.value === S.draft.model);
+          if (info?.efforts && !info.efforts.includes(S.draft.effort)) S.draft.effort = info.efforts[Math.min(1, info.efforts.length - 1)] || null;
+          if (saveDefault) S.boot.defaults = (await api('/api/configure', { method: 'POST', body: { ...S.draft } })).defaults;
         }
-        if (saveDefault) S.boot.defaults = { ...S.boot.defaults, ...next };
+        Object.assign(st, nextOf(c));
       } catch (e) {
         toast(e.message);
       }
@@ -1330,9 +1372,16 @@
           h('div', {}, `更新于 ${relTime(m.lastModified)}`)));
         if (m.source === 'mobile') kids.push(h('button', { class: 'secondary-btn', onclick: rename }, '重命名'));
       }
-      if (foreign) kids.push(h('p', { class: 'note' }, '这是电脑上的对话。下面的设置会用在你从手机继续时复制出的新对话上。'));
+      const a = actualOf(c);
+      if (c?.id && !c.isNew) kids.push(h('div', { class: 'kv' },
+        h('div', {}, a?.model ? `${a.running ? '当前' : '上一轮'}实际：${modelLabel(a.model)} · 思考强度 ${effortLabel(a.effort)}${a.permissionMode ? ` · ${MODE_LABEL[a.permissionMode] || a.permissionMode}` : ''}` : '上一轮实际：未知（记录里没有）'),
+        h('div', {}, '下面的选择从手机发的下一轮开始生效，电脑上的设置不受影响。')));
       kids.push(h('div', { class: 'sec' }, '模型'), optList(S.boot.models.map(m => ({ value: m.value, label: m.label, note: m.note })), st.model, v => apply({ model: v })));
-      kids.push(h('div', { class: 'sec' }, '思考深度'), h('div', { class: 'efforts' }, S.boot.efforts.map(e => h('button', { class: e === st.effort ? 'on' : '', onclick: () => apply({ effort: e }) }, EFFORT_LABEL[e] || e))));
+      const levels = S.boot.models.find(m => m.value === st.model)?.efforts;
+      kids.push(h('div', { class: 'sec' }, '思考强度'));
+      if (levels && !levels.length) kids.push(h('p', { class: 'note' }, '这个模型不支持调节思考强度。'));
+      else kids.push(h('div', { class: 'efforts' }, (levels || S.boot.efforts).map(e => h('button', { class: e === st.effort ? 'on' : '', onclick: () => apply({ effort: e }) }, EFFORT_LABEL[e] || e))));
+      if (!levels) kids.push(h('p', { class: 'note' }, '没读到这个模型支持哪些档位；服务商不支持时会在发送后报错。'));
       kids.push(h('div', { class: 'sec' }, '权限'), optList(S.boot.modes.map(v => ({ value: v, label: MODE_LABEL[v] || v, note: MODE_DESC[v] })), st.permissionMode, v => apply({ permissionMode: v })));
       const sw = h('input', { type: 'checkbox', onchange: () => { saveDefault = sw.checked; if (saveDefault) apply({}); } });
       sw.checked = saveDefault;
@@ -1342,7 +1391,7 @@
       kids.push(h('div', { class: 'sec' }, '显示'), h('label', { class: 'row-toggle' }, h('span', {}, '新的工具步骤默认展开'), h('span', { class: 'switch' }, exp, h('span'))));
       kids.push(h('div', { class: 'sec' }, '连接'), h('div', { class: 'kv' },
         h('div', {}, `Mac 地址：${(S.boot.addresses || []).map(a => `http://${a}:${S.boot.port}/`).join('  ') || '仅本机'}`),
-        h('div', {}, `版本 ${S.boot.version} · ${S.es?.readyState === 1 ? '实时连接正常' : '正在重连'}`)));
+        h('div', {}, `版本 ${S.boot.version}（${S.boot.build || 'unknown'}） · ${S.es?.readyState === 1 ? '实时连接正常' : '正在重连'}`)));
       kids.push(h('button', { class: 'secondary-btn', onclick: closeSheet }, '完成'));
       openSheet(kids);
     };

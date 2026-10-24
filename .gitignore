@@ -20,3 +20,6 @@ web/icons/*.png
 *.tgz
 dist/
 coverage/
+node_modules
+runtime
+BUILD
